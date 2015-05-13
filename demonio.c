@@ -117,7 +117,7 @@ int firma(int tj, char *cadena, char *salida) {
   return 0;
 }
 
-void init_queue (mqd_t * mq_desc, int open_flags) {
+void init_queue (mqd_t * mq_desc, char *name, int open_flags) {
     struct mq_attr attr;
 
     // initialize the queue attributes
@@ -127,7 +127,7 @@ void init_queue (mqd_t * mq_desc, int open_flags) {
     attr.mq_curmsgs = 0;
 
     // create the message queue
-    *mq_desc = mq_open(QUEUE_NAME, open_flags, 0644, &attr);
+    *mq_desc = mq_open(name, open_flags, 0644, &attr);
     CHECK((mqd_t)-1 != *mq_desc);
 }
 
@@ -138,7 +138,7 @@ void init_queue (mqd_t * mq_desc, int open_flags) {
  * Confiamos en que nos llega ya comprobado
  */
 static void *cmdproc (void *data) {
-  mqd_t mq;
+  mqd_t mq, mqgsm;
   char bufer[MAX_SIZE + 1];
   char buferFirma[513];
   char buferEnvio[MAX_SIZE+1];
@@ -147,9 +147,13 @@ static void *cmdproc (void *data) {
   int fd;
 
   //Creamos la cola
-  init_queue(&mq, O_CREAT | O_RDONLY);
+  init_queue(&mq, QUEUENAME, O_CREAT | O_RDONLY);
   CHECK((mqd_t)-1 != mq);
 
+  //Creamos la cola de las ordenes gsm
+  init_queue(&mqgsm, QUEUE_NAMEGSM, O_CREAT | O_WRONLY);
+  CHECK((mqd_t)-1 != mq);
+  
   //Esperamos a la orden
   do {
     ssize_t bytes_read;
@@ -164,18 +168,21 @@ static void *cmdproc (void *data) {
     long n = strtol( bufer, &endptr, 10);
     switch(n) {
       case MSG_STOP: //Salida !!!
-		must_stop=1;
+		      must_stop=1;
 		break;
       case MSG_SIGN: //Firma de mensaje
-		//Leemos el fichero donde escribir
-		fd = strtol( endptr+1, &endptr, 10);
-		if(firma(fd_tj, endptr+1, buferFirma) == 0) {
-			snprintf(buferEnvio, sizeof(buferEnvio),"OK: %s\n", buferFirma);
-			write(fd, buferEnvio, strlen(buferEnvio));
-		} else {
-			write(fd, "ERROR: FIRMA\n", 13);
-		}
-		break;
+      		//Leemos el fichero donde escribir
+      		fd = strtol( endptr+1, &endptr, 10);
+      		if(firma(fd_tj, endptr+1, buferFirma) == 0) {
+      		  //Enviamos resultado directamente a dispositivo
+      			snprintf(buferEnvio, sizeof(buferEnvio),"OK: %s\n", buferFirma);
+      			write(fd, buferEnvio, strlen(buferEnvio));
+      			//Enviamos la firma por GSM
+            CHECK(0 <= mq_send(mqgsm, buferFirma, strlen(buferFirma), 0));
+      		} else {
+      			write(fd, "ERROR: FIRMA\n", 13);
+      		}
+      		break;
     }
 
   } while (!must_stop);
@@ -195,7 +202,7 @@ static void *cmdclient (void *data) {
   int fd = *((int *)data);
 
   //Creamos la cola
-  init_queue(&mq,  O_CREAT | O_WRONLY);
+  init_queue(&mq, QUEUENAME, O_CREAT | O_WRONLY);
   CHECK((mqd_t)-1 != mq);
 
   do {
@@ -245,25 +252,45 @@ static void *cmdclient (void *data) {
 
 }
 
-enum modem_acciones {
-        MODEM_MODULO_AT, //PING si activo y velocidad auto
-        MODEM_MODULO_ECHO,   //No echo
-        MODEM_MODULO_CSQ,    //AT+CSQ Para saber la señal
-        MODEM_MODULO_CGATT0, //AT+CGATT? Para saber n. redes GPRS
-        MODEM_MODULO_CGATT1, //AT+CGATT=1
-        MODEM_MODULO_SAPBR0,  //AT+SAPBR=3,1,"Contype","GPRS" Para setup profile 1
-        MODEM_MODULO_SAPBR1, //AT+SAPBR=3,1,"APN","internet.com" Para establecer APN
-        MODEM_MODULO_SAPBR2, //AT+SAPBR=1,1 Para unir los dos profiles
-        MODEM_MODULO_HTTPINIT, //AT+HTTPINIT Para iniciar peticion
-        MODEM_MODULO_HTTPPARA0, //AT+HTTPPARA="CID",1 Para Hacer POST
-        MODEM_MODULO_HTTPPARA1, //AT+HTTPPARA="URL","http://www.XXXXXXXXX.com/" Para Hacer el POST
-        MODEM_MODULO_HTTPPARA2, //AT+HTTPPARA=100,10000 El 100 son los bytes que enviare incluido el \n
-        MODEM_MODULO_HTTPPARA3, //Aqui se envia los parametros
-        MODEM_MODULO_HTTPACTION,  //AT+HTTPACTION=1 Para lanzar la peticion POST con los datos
-        MODEM_MODULO_HTTPREAD,  //AT+HTTPREAD Para leer resultado
-        MODEM_MODULO_HTTPTERM,   //AT+HTTPTERM Para terminar peticion
-        MODEM_MODULO_SAPBR3    //AT+SAPBR=0,1 Para desconectar. Cuando de el DEACT hemos terminado
-};
+/**
+ * Avanza el estado del fsm.
+ * 
+ */
+funcion char * siguienteEstado(modem_acciones estado ) {
+  switch(estado) {
+    case MODEM_MODULO_AT:
+            return "at\r\n";
+            break;
+    case MODEM_MODULO_ECHO:
+            return "ate0\r\n";
+            break;
+    case MODEM_MODULO_CREG:
+            return "at+creg=2\r\n";
+            break;
+    case MODEM_MODULO_CREG2:
+            return "at+creg?\r\n";
+            break;
+    case MODEM_MODULO_CSQ:
+            return "at+csq\r\n";
+            break;
+    case MODEM_MODULO_CGATT0:
+            return "at+cgatt?\r\n";
+            break;
+    case MODEM_MODULO_CGATT1:
+            return "at+cgatt=1\r\n";
+            break;
+    case MODEM_MODULO_SAPBR0:
+            return "at+sapbr=3,1,\"Contype\",\"GPRS\"\r\n";
+            break;
+    case MODEM_MODULO_SAPBR1:
+            return "at+sapbr=3,1,\"APN\",\"internet.com\"\r\n"";
+            break;
+    case MODEM_MODULO_SAPBR2:
+            return "at+sapbr=1,1\r\n";
+            break;
+  }
+}
+
 
 //Thread que atiende peticiones de gsm y controla este
 static void *cmdgsm (void *fd) {
@@ -275,7 +302,7 @@ static void *cmdgsm (void *fd) {
   modem_acciones estado = MODEM_MODULO_AT; //Inicializar el GSM
 
   //Creamos la cola
-  init_queue(&mq,  O_CREAT | O_WRONLY);
+  init_queue(&mq, QUEUE_NAMEGSM, O_CREAT | O_RDONLY);
   CHECK((mqd_t)-1 != mq);
 
   do {
@@ -293,6 +320,16 @@ static void *cmdgsm (void *fd) {
        *p = 0;
        //Aqui procesar la linea
 
+      //Si estamos inicializando, y recibimos un OK, avanzamos en el estado
+      if (0 == strncmp(bufer,"OK", 5) && estado < MODEM_MODULO_HTTPINIT) {
+        estado++;
+
+      }
+      //Si estamos preparados para enviar un comando, esperamos a recibir algo de la cola.
+      if(MODEM_MODULO_HTTPINIT == estado) {
+        
+        
+      }
 
 
   //Esperar a las peticiones GSM por la cola
